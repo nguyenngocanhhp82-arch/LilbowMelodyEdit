@@ -5,7 +5,7 @@
 
 import { encodeWAV } from '../test/audioTestUtils';
 import { NoteBlob } from './noteSegmenter';
-import { applyNotesPitchShift } from './pitchShifter';
+import { applyNotesPitchShift, pitchShiftBuffer } from './pitchShifter';
 import { getAudioContextClass } from './audioContextHelper';
 import { mergeStems, exportAudioBufferToWav } from './stemMerger';
 
@@ -29,6 +29,12 @@ export class AudioEngine {
   private isLooping: boolean = false;
   private loopStartSec: number = 0;
   private loopEndSec: number = 0;
+
+  // Note Audition / Drag Preview Nodes
+  private previewSourceNode: AudioBufferSourceNode | null = null;
+  private previewOscNode: OscillatorNode | null = null;
+  private previewGainNode: GainNode | null = null;
+  private currentPreviewMidi: number | null = null;
 
   private onPlayheadCallbacks: Set<(currentTime: number) => void> = new Set();
   private animFrameId: number | null = null;
@@ -426,6 +432,128 @@ export class AudioEngine {
       offsetSec: this.vocalOffsetSec,
     });
     return exportAudioBufferToWav(merged);
+  }
+
+  /**
+   * Note Audition / Sostenuto while clicking & holding
+   * Plays the actual pitch-shifted vocal slice looped seamlessly,
+   * blended with a subtle warm pitch oscillator so it sustains as long as the user holds down.
+   */
+  startNotePreview(note: NoteBlob, targetMidi?: number): void {
+    const ctx = this.initContext();
+    this.stopNotePreview();
+
+    const midi = targetMidi !== undefined ? targetMidi : note.targetMidi;
+    const shiftSemitones = midi - note.originalMidi;
+    this.currentPreviewMidi = midi;
+
+    const masterGain = ctx.createGain();
+    masterGain.gain.setValueAtTime(0.001, ctx.currentTime);
+    masterGain.gain.exponentialRampToValueAtTime(0.7, ctx.currentTime + 0.02);
+    masterGain.connect(ctx.destination);
+    this.previewGainNode = masterGain;
+
+    // 1. Play real audio slice if buffer available
+    if (this.originalBuffer) {
+      const rawData = this.originalBuffer.getChannelData(0);
+      const sr = this.originalBuffer.sampleRate;
+      const startSample = Math.max(0, Math.floor(note.startTime * sr));
+      const endSample = Math.min(rawData.length, Math.floor(note.endTime * sr));
+      const length = endSample - startSample;
+
+      if (length > 100) {
+        const slice = rawData.subarray(startSample, endSample);
+        const shifted = pitchShiftBuffer(slice, shiftSemitones, { sampleRate: sr });
+
+        const buf = ctx.createBuffer(1, shifted.length, sr);
+        buf.getChannelData(0).set(shifted);
+
+        const source = ctx.createBufferSource();
+        source.buffer = buf;
+        // Loop sustain portion so holding the note keeps playing
+        source.loop = true;
+        source.loopStart = Math.min(buf.duration * 0.2, 0.1);
+        source.loopEnd = Math.max(source.loopStart + 0.05, buf.duration * 0.85);
+
+        const sliceGain = ctx.createGain();
+        sliceGain.gain.value = 0.85;
+        source.connect(sliceGain);
+        sliceGain.connect(masterGain);
+
+        source.start(0);
+        this.previewSourceNode = source;
+      }
+    }
+
+    // 2. Add pitched vocal-harmonics oscillator layer for pitch reference
+    const freq = 440 * Math.pow(2, (midi - 69) / 12);
+    const osc = ctx.createOscillator();
+    osc.type = 'triangle'; // Warm vocal-like timbre
+    osc.frequency.setValueAtTime(freq, ctx.currentTime);
+
+    const oscGain = ctx.createGain();
+    oscGain.gain.value = 0.2;
+    osc.connect(oscGain);
+    oscGain.connect(masterGain);
+
+    osc.start();
+    this.previewOscNode = osc;
+  }
+
+  /**
+   * Update audition pitch dynamically while dragging note vertically
+   */
+  updateNotePreviewPitch(note: NoteBlob, newTargetMidi: number): void {
+    if (this.currentPreviewMidi === newTargetMidi) return;
+    this.currentPreviewMidi = newTargetMidi;
+    const ctx = this.initContext();
+
+    // Immediately update oscillator frequency for responsive drag audio
+    if (this.previewOscNode) {
+      const freq = 440 * Math.pow(2, (newTargetMidi - 69) / 12);
+      this.previewOscNode.frequency.cancelScheduledValues(ctx.currentTime);
+      this.previewOscNode.frequency.setTargetAtTime(freq, ctx.currentTime, 0.015);
+    }
+
+    // Re-trigger note preview at new pitch
+    this.startNotePreview(note, newTargetMidi);
+  }
+
+  /**
+   * Stop audition sound smoothly on mouse release
+   */
+  stopNotePreview(): void {
+    if (this.previewGainNode && this.ctx) {
+      const ctx = this.ctx;
+      const gain = this.previewGainNode;
+      const src = this.previewSourceNode;
+      const osc = this.previewOscNode;
+
+      try {
+        gain.gain.cancelScheduledValues(ctx.currentTime);
+        gain.gain.setValueAtTime(Math.max(0.001, gain.gain.value), ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.03);
+      } catch {
+        // ignore
+      }
+
+      setTimeout(() => {
+        try {
+          src?.stop();
+          src?.disconnect();
+          osc?.stop();
+          osc?.disconnect();
+          gain.disconnect();
+        } catch {
+          // ignore
+        }
+      }, 35);
+    }
+
+    this.previewSourceNode = null;
+    this.previewOscNode = null;
+    this.previewGainNode = null;
+    this.currentPreviewMidi = null;
   }
 
   /**

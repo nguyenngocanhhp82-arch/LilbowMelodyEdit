@@ -8,6 +8,7 @@ import {
   ScaleType,
 } from '../core/scaleEngine';
 import { ZoomIn, ZoomOut, Maximize2, ChevronLeft, ChevronRight, MoveHorizontal, Repeat } from 'lucide-react';
+import { audioEngine } from '../core/audioPlayer';
 
 interface PianoRollProps {
   notes: NoteBlob[];
@@ -90,6 +91,19 @@ export const PianoRoll: React.FC<PianoRollProps> = ({
       setScrollY(Math.max(0, targetY));
     }
   }, [notes.length]);
+
+  // Global mouseup listener to guarantee audio preview stops cleanly
+  useEffect(() => {
+    const handleGlobalMouseUp = () => {
+      audioEngine.stopNotePreview();
+      draggingNoteRef.current = null;
+      if (rulerDragRef.current) {
+        rulerDragRef.current = null;
+      }
+    };
+    window.addEventListener('mouseup', handleGlobalMouseUp);
+    return () => window.removeEventListener('mouseup', handleGlobalMouseUp);
+  }, []);
 
   // Update viewport width on resize
   useEffect(() => {
@@ -596,6 +610,9 @@ export const PianoRoll: React.FC<PianoRollProps> = ({
         };
         const updated = notes.map((n) => ({ ...n, isSelected: n.id === note.id }));
         onNotesChange(updated);
+
+        // Phát tiếng ngay khi ấn vào note & giữ tiếng nếu đang giữ chuột!
+        audioEngine.startNotePreview(note, note.targetMidi);
         return;
       }
     }
@@ -657,6 +674,12 @@ export const PianoRoll: React.FC<PianoRollProps> = ({
         return n;
       });
       onNotesChange(updated);
+
+      // Phát tiếng thay đổi cao độ thời gian thực khi kéo note lên / xuống!
+      const targetNote = notes.find((n) => n.id === noteId);
+      if (targetNote) {
+        audioEngine.updateNotePreviewPitch(targetNote, targetMidi);
+      }
       return;
     }
 
@@ -677,6 +700,9 @@ export const PianoRoll: React.FC<PianoRollProps> = ({
   };
 
   const handleMouseUp = () => {
+    // Dừng phát tiếng note khi thả chuột
+    audioEngine.stopNotePreview();
+
     // If user clicked on ruler without dragging, perform a Seek!
     if (rulerDragRef.current) {
       if (!rulerDragRef.current.hasDragged) {
